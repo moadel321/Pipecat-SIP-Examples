@@ -10,6 +10,7 @@ import subprocess
 import sys
 from contextlib import asynccontextmanager
 import time
+import socket
 
 import aiohttp
 from fastapi import FastAPI, HTTPException, Request, Form
@@ -557,28 +558,109 @@ async def twilio_test():
     return {"status": "success", "message": "Twilio test endpoint is accessible"}
 
 
-@app.post("/twilio_webhook")
-async def twilio_webhook(
-    request: Request,
-    CallSid: str = Form(...),
-    From: str = Form(None),
-    To: str = Form(None),
-    CallStatus: str = Form(None),
-):
+@app.get("/debug_server_info")
+async def debug_server_info():
     """
-    Handle Twilio webhook for incoming calls.
+    Enhanced endpoint to debug server configuration and connectivity issues.
+    Returns detailed information about the server's network setup.
+    """
+    # Get hostname and local IP
+    hostname = socket.gethostname()
     
-    This endpoint will:
-    1. Create a Daily room with SIP capabilities
-    2. Get a token for the bot
-    3. Start the dial-in bot with Twilio parameters
-    4. Return TwiML to put the call in a waiting state
+    # Get all IP addresses
+    ips = []
+    try:
+        # Try to get all IP addresses including public ones
+        hostname_info = socket.gethostbyname_ex(hostname)
+        ips = hostname_info[2]
+    except Exception as e:
+        ips = ["Error getting IPs: " + str(e)]
+    
+    # Try to get public IP
+    public_ip = None
+    try:
+        # Simple way to get public IP - connect to external service
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        public_ip = s.getsockname()[0]
+        s.close()
+    except Exception as e:
+        public_ip = f"Error getting public IP: {str(e)}"
+    
+    # Get all network interfaces
+    interfaces = {}
+    try:
+        import netifaces
+        for iface in netifaces.interfaces():
+            try:
+                addrs = netifaces.ifaddresses(iface)
+                if netifaces.AF_INET in addrs:
+                    interfaces[iface] = addrs[netifaces.AF_INET]
+            except Exception as e:
+                interfaces[f"{iface}_error"] = str(e)
+    except ImportError:
+        interfaces = {"error": "netifaces package not installed"}
+    
+    # Get port status
+    port_status = {}
+    for port in [7860, 80, 443]:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(('0.0.0.0', port))
+            s.close()
+            port_status[str(port)] = "Available (not in use)"
+        except Exception as e:
+            port_status[str(port)] = f"In use or unavailable: {str(e)}"
+    
+    # Get server config
+    server_config = {}
+    if 'config' in globals():
+        server_config = {
+            "host": config.host,
+            "port": config.port,
+            "ssl_enabled": not config.no_ssl,
+            "reload": config.reload,
+            "log_level": config.log_level
+        }
+    
+    return {
+        "hostname": hostname,
+        "ip_addresses": ips,
+        "public_ip": public_ip,
+        "interfaces": interfaces,
+        "port_status": port_status,
+        "env_vars": {
+            "HOST": os.getenv("HOST", "0.0.0.0"),
+            "PORT": os.getenv("FAST_API_PORT", "7860"),
+        },
+        "server_config": server_config,
+        "api_url": f"http://{public_ip}:7860" if public_ip and not isinstance(public_ip, str) else "Unknown"
+    }
+
+
+@app.post("/twilio_webhook")
+async def twilio_webhook(request: Request):
+    """
+    Handle Twilio webhook for incoming calls with more robust error handling.
+    Uses TwiML to connect the caller to the Daily.co SIP endpoint.
     """
     try:
-        # Log all request headers and form data for debugging
-        logger.debug(f"Twilio webhook received - Headers: {dict(request.headers)}")
-        logger.debug(f"Twilio webhook form data: CallSid={CallSid}, From={From}, To={To}, Status={CallStatus}")
-        logger.info(f"Received Twilio webhook: CallSid={CallSid}, From={From}, To={To}, Status={CallStatus}")
+        # Log raw request first
+        body = await request.body()
+        form_data = await request.form()
+        headers = dict(request.headers)
+        
+        logger.info(f"Twilio webhook raw request body: {body}")
+        logger.info(f"Twilio webhook form data: {form_data}")
+        logger.info(f"Twilio webhook headers: {headers}")
+        
+        # Try to extract fields, but don't require them to be present
+        call_sid = form_data.get("CallSid", "unknown")
+        from_number = form_data.get("From", "unknown")
+        to_number = form_data.get("To", "unknown")
+        call_status = form_data.get("CallStatus", "unknown")
+        
+        logger.info(f"Received Twilio webhook: CallSid={call_sid}, From={from_number}, To={to_number}, Status={call_status}")
         
         # Create a Daily room with SIP capabilities
         properties = DailyRoomProperties(
@@ -594,43 +676,116 @@ async def twilio_webhook(
         room = await daily_helpers["rest"].create_room(params=params)
         logger.info(f"Created room: {room.url} with SIP endpoint: {room.config.sip_endpoint}")
         
-        # Get a token for the bot
-        token = await daily_helpers["rest"].get_token(room.url)
+        # Only start the bot if we have a valid SIP endpoint
+        if room.config.sip_endpoint:
+            # Get a token for the bot
+            token = await daily_helpers["rest"].get_token(room.url)
+            
+            # Store SIP URI in environment for the bot
+            env = os.environ.copy()
+            env["DAILY_SIP_URI"] = room.config.sip_endpoint
+            env["TWILIO_CALL_SID"] = call_sid
+            
+            # Start the dial-in bot with Twilio parameters - don't try to redirect call here
+            logger.info(f"Starting Twilio dial-in bot with parameters: room_url={room.url}, token={token[:10]}..., call_sid={call_sid}")
+            proc = subprocess.Popen(
+                [sys.executable, "dial_in.py", "-u", room.url, "-t", token, "-i", call_sid, "-s", room.config.sip_endpoint],
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+                env=env
+            )
+            
+            logger.info(f"Started Twilio dial-in bot with PID: {proc.pid}")
+            
+            # Track the process
+            bot_procs[proc.pid] = (proc, room.url)
         
-        # Start the dial-in bot with Twilio parameters
-        # Note: Using the CallSid and SIP URI instead of callId and callDomain
-        logger.info(f"Starting Twilio dial-in bot with parameters: room_url={room.url}, token={token[:10]}..., call_sid={CallSid}, sip_uri={room.config.sip_endpoint}")
-        proc = subprocess.Popen(
-            [sys.executable, "dial_in.py", "-u", room.url, "-t", token, "-i", CallSid, "-s", room.config.sip_endpoint],
-            cwd=os.path.dirname(os.path.abspath(__file__))
-        )
+        # Return enhanced TwiML to better handle the connection to the SIP endpoint
+        # We add more parameters to improve success rate and prevent early disconnection
+        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say>Please wait while we connect you to our AI assistant.</Say>
+    <Play loop="3">https://demo.twilio.com/docs/classic.mp3</Play>
+    <Dial action="/dial_status?call_sid={call_sid}" timeout="60" ringTone="us">
+        <Sip username="daily-user" password="no-password" 
+             statusCallbackEvent="initiated ringing answered completed" 
+             statusCallback="http://49.13.226.238:7860/sip_status?call_sid={call_sid}">{room.config.sip_endpoint}</Sip>
+    </Dial>
+    <Say>We're having trouble connecting your call. Please try again later.</Say>
+</Response>"""
         
-        logger.info(f"Started Twilio dial-in bot with PID: {proc.pid}")
-        
-        # Track the process
-        bot_procs[proc.pid] = (proc, room.url)
-        
-        # Return TwiML to put the call in a waiting state
-        # The bot will update this call with the SIP URI when ready
-        twiml = f"""
-        <?xml version="1.0" encoding="UTF-8"?>
-        <Response>
-            <Say>Please wait while we connect you to our AI assistant.</Say>
-            <Play loop="10">https://demo.twilio.com/docs/classic.mp3</Play>
-        </Response>
-        """
-        
+        logger.info(f"Returning enhanced TwiML response to Twilio to connect to SIP endpoint: {room.config.sip_endpoint}")
         return Response(content=twiml, media_type="application/xml")
     except Exception as e:
-        logger.error(f"Error in twilio_webhook: {str(e)}")
-        # Return a more Twilio-friendly error
-        twiml = f"""
-        <?xml version="1.0" encoding="UTF-8"?>
-        <Response>
-            <Say>We're sorry, but there was an error connecting to our service. Please try again later.</Say>
-        </Response>
-        """
+        logger.error(f"Error in twilio_webhook: {str(e)}", exc_info=True)
+        # Return a more Twilio-friendly error response
+        twiml = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say>We're sorry, but there was an error connecting to our service. Please try again later.</Say>
+    <Play>https://demo.twilio.com/docs/classic.mp3</Play>
+</Response>"""
         return Response(content=twiml, media_type="application/xml")
+
+
+@app.post("/dial_status")
+async def dial_status(request: Request):
+    """Handle the status callback from Twilio's Dial verb"""
+    try:
+        form_data = await request.form()
+        
+        dial_call_status = form_data.get("DialCallStatus", "unknown")
+        call_sid = form_data.get("call_sid", "unknown")
+        
+        logger.info(f"Received Dial status callback: CallSid={call_sid}, DialCallStatus={dial_call_status}")
+        
+        # Return TwiML based on the dial status
+        if dial_call_status == "completed":
+            # Call was successful and completed normally
+            return Response(
+                content="<?xml version='1.0' encoding='UTF-8'?><Response><Say>Thank you for your call. Goodbye.</Say></Response>",
+                media_type="application/xml"
+            )
+        elif dial_call_status in ["busy", "no-answer", "failed", "canceled"]:
+            # Call failed to connect
+            logger.error(f"SIP call failed with status: {dial_call_status}")
+            return Response(
+                content="<?xml version='1.0' encoding='UTF-8'?><Response><Say>We're sorry, but there was an error connecting to our AI assistant. Please try again later.</Say></Response>",
+                media_type="application/xml"
+            )
+        else:
+            # Any other status
+            return Response(
+                content="<?xml version='1.0' encoding='UTF-8'?><Response><Say>Your call has ended. Thank you.</Say></Response>",
+                media_type="application/xml"
+            )
+    except Exception as e:
+        logger.error(f"Error in dial_status: {str(e)}")
+        return Response(
+            content="<?xml version='1.0' encoding='UTF-8'?><Response><Say>An error occurred. Goodbye.</Say></Response>",
+            media_type="application/xml"
+        )
+
+
+@app.post("/sip_status")
+async def sip_status(request: Request):
+    """Handle status callbacks from the SIP connection"""
+    try:
+        form_data = await request.form()
+        logger.info(f"SIP status callback: {dict(form_data)}")
+        return {"status": "received"}
+    except Exception as e:
+        logger.error(f"Error in sip_status: {str(e)}")
+        return {"status": "error", "message": str(e)}
+
+
+# Add a new helper endpoint for verifying TwiML
+@app.get("/test_twiml")
+async def test_twiml():
+    """Test endpoint that returns a simple TwiML response to verify formatting"""
+    twiml = """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say>This is a test TwiML response.</Say>
+</Response>"""
+    return Response(content=twiml, media_type="application/xml")
 
 
 if __name__ == "__main__":
@@ -653,7 +808,8 @@ if __name__ == "__main__":
     parser.add_argument("--reload", action="store_true", help="Reload code on change")
     parser.add_argument("--ssl-cert", type=str, default=default_ssl_cert, help="Path to SSL certificate file")
     parser.add_argument("--ssl-key", type=str, default=default_ssl_key, help="Path to SSL key file")
-    parser.add_argument("--no-ssl", action="store_true", help="Disable SSL/HTTPS")
+    parser.add_argument("--no-ssl", action="store_true", default=True, help="Disable SSL/HTTPS (default: True)")
+    parser.add_argument("--use-ssl", action="store_true", help="Enable SSL/HTTPS (overrides no-ssl)")
     parser.add_argument("--log-level", type=str, default=default_log_level, 
                         choices=["TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"],
                         help="Set the logging level (TRACE is most verbose)")
@@ -661,6 +817,10 @@ if __name__ == "__main__":
                         help="HTTP client debug level (0=off, 1=basic, 2=verbose)")
 
     config = parser.parse_args()
+    
+    # If --use-ssl is specified, override the --no-ssl setting
+    if config.use_ssl:
+        config.no_ssl = False
     
     # Set port to 80 if --port-80 flag is used
     if config.port_80:
@@ -699,22 +859,43 @@ if __name__ == "__main__":
     else:
         uvicorn_log_level = "info"  # Default
     
-    # Print Twilio webhook URL information
+    # Detect public IP for better URL display
+    public_ip = config.host
+    if public_ip == "0.0.0.0":
+        try:
+            # Try to get a more useful IP address for URLs
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            public_ip = s.getsockname()[0]
+            s.close()
+        except:
+            # If we can't determine a better IP, use localhost as fallback
+            public_ip = "127.0.0.1"
+            logger.warning(f"Could not determine server's public IP. Using {public_ip} for URLs")
+    
+    # Print Twilio webhook URL information with the detected IP
     protocol = "http" if config.no_ssl else "https"
     port_info = f":{config.port}" if config.port != (80 if protocol == "http" else 443) else ""
-    webhook_url = f"{protocol}://{config.host}{port_info}/twilio_webhook"
-    test_url = f"{protocol}://{config.host}{port_info}/twilio_test"
+    webhook_url = f"{protocol}://{public_ip}{port_info}/twilio_webhook"
+    test_url = f"{protocol}://{public_ip}{port_info}/twilio_test"
+    debug_url = f"{protocol}://{public_ip}{port_info}/debug_server_info"
     
     logger.info(f"✨ Use this webhook URL in Twilio: {webhook_url}")
     logger.info(f"👉 Test Twilio connectivity by accessing: {test_url}")
+    logger.info(f"🔍 Debug server configuration at: {debug_url}")
     logger.info(f"ℹ️ If using your IP without a domain name, ensure port {config.port} is publicly accessible")
     
     if config.no_ssl:
         logger.info(f"Starting server WITHOUT SSL on http://{config.host}:{config.port}")
-        print(f"To join a test room, visit http://{config.host}:{config.port}/")
+        print(f"To join a test room, visit http://{public_ip}:{config.port}/")
+        # Explicitly set host to 0.0.0.0 if it's not already
+        host_to_use = "0.0.0.0" if config.host == "localhost" or config.host == "127.0.0.1" else config.host
+        if host_to_use != config.host:
+            logger.warning(f"Changed host from {config.host} to {host_to_use} to accept external connections")
+        
         uvicorn.run(
             "server:app",
-            host=config.host,
+            host=host_to_use,
             port=config.port,
             reload=config.reload,
             log_level=uvicorn_log_level,
@@ -723,22 +904,41 @@ if __name__ == "__main__":
         # Check if the certificate files exist
         if not os.path.exists(config.ssl_cert):
             logger.error(f"SSL certificate not found at {config.ssl_cert}")
-            print(f"SSL certificate not found. Run with --no-ssl to disable HTTPS or provide valid certificate paths.")
-            sys.exit(1)
+            logger.warning("Falling back to HTTP mode without SSL")
+            print(f"SSL certificate not found. Running without SSL.")
             
-        if not os.path.exists(config.ssl_key):
+            # Fall back to HTTP
+            host_to_use = "0.0.0.0" if config.host == "localhost" or config.host == "127.0.0.1" else config.host
+            uvicorn.run(
+                "server:app",
+                host=host_to_use,
+                port=config.port,
+                reload=config.reload,
+                log_level=uvicorn_log_level,
+            )
+        elif not os.path.exists(config.ssl_key):
             logger.error(f"SSL key not found at {config.ssl_key}")
-            print(f"SSL key not found. Run with --no-ssl to disable HTTPS or provide valid certificate paths.")
-            sys.exit(1)
+            logger.warning("Falling back to HTTP mode without SSL")
+            print(f"SSL key not found. Running without SSL.")
             
-        logger.info(f"Starting server with SSL on https://{config.host}:{config.port}")
-        print(f"To join a test room, visit https://{config.host}:{config.port}/")
-        uvicorn.run(
-            "server:app",
-            host=config.host,
-            port=config.port,
-            reload=config.reload,
-            ssl_keyfile=config.ssl_key,
-            ssl_certfile=config.ssl_cert,
-            log_level=uvicorn_log_level,
-        )
+            # Fall back to HTTP
+            host_to_use = "0.0.0.0" if config.host == "localhost" or config.host == "127.0.0.1" else config.host
+            uvicorn.run(
+                "server:app",
+                host=host_to_use,
+                port=config.port,
+                reload=config.reload,
+                log_level=uvicorn_log_level,
+            )
+        else:
+            logger.info(f"Starting server with SSL on https://{config.host}:{config.port}")
+            print(f"To join a test room, visit https://{public_ip}:{config.port}/")
+            uvicorn.run(
+                "server:app",
+                host=config.host,
+                port=config.port,
+                reload=config.reload,
+                ssl_keyfile=config.ssl_key,
+                ssl_certfile=config.ssl_cert,
+                log_level=uvicorn_log_level,
+            )

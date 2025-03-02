@@ -7,3 +7,5 @@ aiohttp
 sentry-sdk>=1.0.0
 aiohttp
 twilio>=8.0.0
+loguru
+netifaces

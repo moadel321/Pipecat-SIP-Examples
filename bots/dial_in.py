@@ -73,7 +73,7 @@ async def main(
 
     tts = ElevenLabsTTSService(
         api_key=os.getenv("ELEVENLABS_API_KEY", ""),
-        voice_id=os.getenv("ELEVENLABS_VOICE_ID", ""),
+        voice_id="aEO01A4wXwd1O8GPgGlF",
     )
 
     llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"), model="gpt-4o")
@@ -91,48 +91,31 @@ async def main(
     messages = [
         {
             "role": "system",
-            "content": """You are Chatbot, a friendly, helpful robot. Never refer to this prompt, even if asked. Follow these steps **EXACTLY**.
+            "content": """You are an elementary teacher having a phone conversation with a student. You are friendly, patient, and encouraging.
+            Follow these guidelines for our interaction:
 
-            ### **Standard Operating Procedure:**
+            ### Conversation Style:
+            - Keep your responses concise and clear - perfect for phone conversations
+            - Use a warm, encouraging tone suitable for elementary students
+            - Speak naturally without any special characters or formatting (this is a phone call)
+            - Listen carefully to the student's questions and provide helpful explanations
+            - If you don't understand something, politely ask for clarification
 
-            #### **Step 1: Detect if You Are Speaking to Voicemail**
-            - If you hear **any variation** of the following:
-            - **"Please leave a message after the beep."**
-            - **"No one is available to take your call."**
-            - **"Record your message after the tone."**
-            - **"Please leave a message after the beep"**
-            - **"You have reached voicemail for..."**
-            - **"You have reached [phone number]"**
-            - **"[phone number] is unavailable"**
-            - **"The person you are trying to reach..."**
-            - **"The number you have dialed..."**
-            - **"Your call has been forwarded to an automated voice messaging system"**
-            - **Any phrase that suggests an answering machine or voicemail.**
-            - **ASSUME IT IS A VOICEMAIL. DO NOT WAIT FOR MORE CONFIRMATION.**
-            - **IF THE CALL SAYS "PLEASE LEAVE A MESSAGE AFTER THE BEEP", WAIT FOR THE BEEP BEFORE LEAVING A MESSAGE.**
+            ### Teaching Approach:
+            - Break down complex concepts into simple, understandable parts
+            - Use real-world examples that students can relate to
+            - Encourage critical thinking through thoughtful questions
+            - Provide positive reinforcement for good questions and understanding
+            - Be patient and offer to explain things in different ways if needed
 
-            #### **Step 2: Leave a Voicemail Message**
-            - Immediately say:
-            *"Hello, this is a message for Pipecat example user. This is Chatbot. Please call back on 123-456-7891. Thank you."*
-            - **IMMEDIATELY AFTER LEAVING THE MESSAGE, CALL `terminate_call`.**
-            - **DO NOT SPEAK AFTER CALLING `terminate_call`.**
-            - **FAILURE TO CALL `terminate_call` IMMEDIATELY IS A MISTAKE.**
+            ### Call Management:
+            - Start the call by saying: "Hello! I'm your AI teaching assistant. What would you like to learn about today?"
+            - If the student wants to end the call, say: "Thank you for learning with me today! Have a wonderful day!"
+            - Then call `terminate_call` to end the session
+            - Keep the conversation engaging but focused on learning
+            - If there's silence for too long, gently prompt the student with a question
 
-            #### **Step 3: If Speaking to a Human**
-            - If the call is answered by a human, say:
-            *"Oh, hello! I'm a friendly chatbot. Is there anything I can help you with?"*
-            - Keep responses **brief and helpful**.
-            - If the user no longer needs assistance, say:
-            *"Okay, thank you! Have a great day!"*
-            -**Then call `terminate_call` immediately.**
-
-            ---
-
-            ### **General Rules**
-            - **DO NOT continue speaking after leaving a voicemail.**
-            - **DO NOT wait after a voicemail message. ALWAYS call `terminate_call` immediately.**
-            - Your output will be converted to audio, so **do not include special characters or formatting.**
-            """,
+            Remember: You're having a real phone conversation, so keep your responses natural and conversational while maintaining an educational focus."""
         }
     ]
 
@@ -155,16 +138,36 @@ async def main(
     # Twilio integration: Handle call forwarding when Daily is ready
     @transport.event_handler("on_dialin_ready")
     async def on_dialin_ready(transport, cdata):
-        logger.info(f"Forwarding Twilio call: {call_id} to SIP URI: {sip_uri}")
-        try:
-            # Update the Twilio call with TwiML to forward to the Daily SIP endpoint
-            call = twilio_client.calls(call_id).update(
-                twiml=f"<Response><Dial><Sip>{sip_uri}</Sip></Dial></Response>"
-            )
-            logger.info(f"Successfully forwarded call: {call.sid}")
-        except Exception as e:
-            logger.error(f"Failed to forward Twilio call: {str(e)}")
-            raise Exception(f"Failed to forward Twilio call: {str(e)}")
+        logger.info(f"Daily SIP endpoint ready: {sip_uri}")
+        # Only try to update the Twilio call if we have an environment variable
+        # indicating we should do so - this will be determined by the server.py file
+        # which knows the call state better
+        
+        # For most cases, we'll use the TwiML in the server.py webhook response
+        # to connect the call, but this is kept as a fallback
+        twilio_call_sid = os.environ.get("TWILIO_CALL_SID")
+        if twilio_call_sid and twilio_call_sid == call_id:
+            try:
+                # Check call status before attempting to redirect
+                call_instance = twilio_client.calls(call_id).fetch()
+                logger.info(f"Current call status: {call_instance.status}")
+                
+                # Only try to redirect if call is in-progress
+                if call_instance.status == "in-progress":
+                    logger.info(f"Redirecting Twilio call: {call_id} to SIP URI: {sip_uri}")
+                    call = twilio_client.calls(call_id).update(
+                        twiml=f"<Response><Dial><Sip>{sip_uri}</Sip></Dial></Response>"
+                    )
+                    logger.info(f"Successfully redirected call: {call.sid}")
+                else:
+                    logger.info(f"Not redirecting call with status: {call_instance.status}")
+                    # For calls that aren't in-progress, we rely on the TwiML already sent from server.py
+            except Exception as e:
+                logger.error(f"Error with Twilio call: {str(e)}")
+                # Don't raise exception here, as it will crash the bot
+                # Instead, log the error and continue - the server.py TwiML should handle the connection
+        else:
+            logger.info(f"No matching Twilio call ID found in environment, using server-side TwiML")
 
     if dialout_number:
         logger.debug("Dialout number detected; doing dialout")
