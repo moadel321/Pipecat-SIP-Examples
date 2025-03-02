@@ -1,0 +1,9 @@
+python-dotenv
+fastapi[all]
+uvicorn
+pipecat-ai[daily,cartesia,openai,silero,gladia, assemblyai, deepgram, groq, google, elevenlabs , playht, rime, sentry]
+pipecat-ai-flows
+aiohttp
+sentry-sdk>=1.0.0
+aiohttp
+twilio>=8.0.0
