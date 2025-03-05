@@ -625,9 +625,6 @@ async def handle_dial_out(request: Request) -> JSONResponse:
     """Handle outbound calls to phone numbers."""
     logger.info("=== Received dial-out request ===")
     
-    # Use specified room URL, or create a new one if not specified
-    room_url = os.getenv("DAILY_SAMPLE_ROOM_URL", None)
-    
     # Get the dial-out properties from the request
     try:
         data = await request.json()
@@ -656,34 +653,27 @@ async def handle_dial_out(request: Request) -> JSONResponse:
     
     logger.info(f"Processing dial-out request to phone number: {phone_number}")
     
-    # Create a room with SIP settings if needed
+    # Create a room with SIP settings
     try:
-        if not room_url:
-            # Create base properties with SIP and dialout enabled
-            properties = DailyRoomProperties(
-                sip=DailyRoomSipParams(
-                    display_name="dial-out-bot", 
-                    video=False, 
-                    sip_mode="direct", 
-                    num_endpoints=1
-                ),
-                enable_dialout=True
-            )
-                
-            params = DailyRoomParams(properties=properties)
+        # Create base properties with SIP and dialout enabled
+        # Always create a new room for dial-out to ensure it has dialout capabilities
+        properties = DailyRoomProperties(
+            sip=DailyRoomSipParams(
+                display_name="dial-out-bot", 
+                video=False, 
+                sip_mode="dial-in",  # Changed from "direct" to "dial-in" as required by Daily.co API
+                num_endpoints=1
+            ),
+            enable_dialout=True
+        )
             
-            logger.info("Creating new room with SIP and dialout settings...")
-            room = await daily_helpers["rest"].create_room(params=params)
-            room_url = room.url
-        else:
-            # Check if passed room URL exists
-            try:
-                room = await daily_helpers["rest"].get_room_from_url(room_url)
-            except Exception as e:
-                logger.error(f"Room not found: {room_url}, Error: {str(e)}")
-                raise HTTPException(status_code=404, detail=f"Room not found: {room_url}")
+        params = DailyRoomParams(properties=properties)
         
-        logger.info(f"Daily room: {room.url}")
+        logger.info("Creating new room with SIP and dialout settings...")
+        room = await daily_helpers["rest"].create_room(params=params)
+        room_url = room.url
+        
+        logger.info(f"Created Daily room: {room.url}")
         
         # Get a token for the bot to join the session
         token = await daily_helpers["rest"].get_token(room.url, MAX_SESSION_TIME)
