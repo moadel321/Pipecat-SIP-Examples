@@ -698,7 +698,6 @@ async def handle_dial_out(request: Request) -> JSONResponse:
             sip=DailyRoomSipParams(
                 display_name="dial-out-bot", 
                 video=False, 
-                sip_mode="dial-in",  # Changed back to dial-in as required by the Daily API
                 num_endpoints=1
             ),
             enable_dialout=True,  # Explicitly enable dial-out
