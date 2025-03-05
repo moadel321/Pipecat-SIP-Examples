@@ -54,7 +54,7 @@ async def main(
     
     Args:
         room_url: Daily room URL
-        token: Daily room token
+        token: Daily room token (owner token with dial-out permissions)
         phone_number: The phone number to dial out to
         detect_voicemail: Whether to enable voicemail detection
     """
@@ -63,7 +63,7 @@ async def main(
     # Configure the Daily transport
     transport = DailyTransport(
         room_url,
-        token,
+        token,  # This should be an owner token with dial-out permissions
         "Outbound Bot",
         DailyParams(
             api_url=daily_api_url,
@@ -150,7 +150,28 @@ async def main(
     async def on_joined(transport, data):
         logger.info(f"Joined Daily room; initiating dial-out to: {phone_number}")
         # Start the dial-out process to the specified phone number
-        await transport.start_dialout({"phoneNumber": phone_number})
+        # The phone number should be prefixed with + for international format
+        # For example: +12025550123 for a US number
+        try:
+            formatted_phone = phone_number if phone_number.startswith("+") else f"+{phone_number}"
+            logger.info(f"Initiating dial-out to formatted number: {formatted_phone}")
+            
+            # Format the SIP URI according to Twilio's requirements
+            # Use the format: sip:{phone_number}@{domain}.sip.twilio.com
+            twilio_domain = os.getenv("TWILIO_SIP_DOMAIN", "voxximai-twilio-integrationom")
+            sip_uri = f"sip:{formatted_phone}@{twilio_domain}.sip.twilio.com"
+            logger.info(f"Using SIP URI for dialout: {sip_uri}")
+            
+            # Pass the properly formatted SIP URI for Twilio integration
+            await transport.start_dialout({
+                "sipUri": sip_uri,
+                "displayName": formatted_phone,
+                "video": False
+            })
+        except Exception as e:
+            logger.error(f"Error initiating dial-out: {str(e)}")
+            # If dial-out fails, we should end the task
+            await task.cancel()
 
     @transport.event_handler("on_dialout_connected")
     async def on_dialout_connected(transport, data):
@@ -159,6 +180,15 @@ async def main(
     @transport.event_handler("on_dialout_answered")
     async def on_dialout_answered(transport, data):
         logger.info(f"Dial-out answered: {data}")
+        
+    @transport.event_handler("on_dialout_error")
+    async def on_dialout_error(transport, data):
+        logger.error(f"Dial-out error occurred: {data}")
+        await task.cancel()
+        
+    @transport.event_handler("on_dialout_stopped")
+    async def on_dialout_stopped(transport, data):
+        logger.info(f"Dial-out stopped: {data}")
 
     @transport.event_handler("on_first_participant_joined")
     async def on_first_participant_joined(transport, participant):

@@ -132,6 +132,39 @@ async def lifespan(app: FastAPI):
         daily_api_url="https://api.daily.co/v1",
         aiohttp_session=aiohttp_session,
     )
+    
+    # Add method to create owner meeting tokens
+    async def create_meeting_token(properties):
+        """
+        Create a Daily meeting token with the given properties
+        """
+        try:
+            url = f"{daily_helpers['rest'].daily_api_url}/meeting-tokens"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {daily_helpers['rest'].daily_api_key}"
+            }
+            
+            payload = {"properties": properties}
+            logger.info(f"Creating meeting token with properties: {properties}")
+            
+            async with daily_helpers['rest'].aiohttp_session as session:
+                async with session.post(url, json=payload, headers=headers) as response:
+                    if response.status >= 400:
+                        error_text = await response.text()
+                        logger.error(f"Error creating meeting token: {error_text}, Status: {response.status}")
+                        return None
+                    
+                    result = await response.json()
+                    logger.info(f"Successfully created meeting token")
+                    return result.get("token")
+        except Exception as e:
+            logger.error(f"Error creating meeting token: {str(e)}")
+            return None
+    
+    # Attach the method to the helper instance
+    daily_helpers["rest"].create_meeting_token = create_meeting_token
+    
     logger.info("Application startup complete")
     yield
     logger.info("Shutting down application...")
@@ -325,7 +358,11 @@ async def rtvi_connect(request: Request):
                 start_audio_off=False,
                 start_video_off=True,
                 eject_at_room_exp=True,  # Eject participants when room expires
-                enable_prejoin_ui=False  #  Skip the prejoin UI
+                enable_prejoin_ui=False,  # Skip the prejoin UI
+                enable_network_ui=False,
+                enable_screenshare=False,
+                enable_knocking=False,
+                enable_dialout=True,
             )
             
             # Create room parameters with properties
@@ -661,10 +698,15 @@ async def handle_dial_out(request: Request) -> JSONResponse:
             sip=DailyRoomSipParams(
                 display_name="dial-out-bot", 
                 video=False, 
-                sip_mode="dial-in",  # Changed from "direct" to "dial-in" as required by Daily.co API
+                sip_mode="dial-in",  # Changed back to dial-in as required by the Daily API
                 num_endpoints=1
             ),
-            enable_dialout=True
+            enable_dialout=True,  # Explicitly enable dial-out
+            enable_network_ui=False,
+            enable_screenshare=False,
+            enable_knocking=False,
+            start_audio_off=False,
+            start_video_off=True,
         )
             
         params = DailyRoomParams(properties=properties)
@@ -675,14 +717,21 @@ async def handle_dial_out(request: Request) -> JSONResponse:
         
         logger.info(f"Created Daily room: {room.url}")
         
-        # Get a token for the bot to join the session
-        token = await daily_helpers["rest"].get_token(room.url, MAX_SESSION_TIME)
+        # Create an owner token with dial-out permissions
+        owner_token_properties = {
+            "is_owner": True,
+            "room_name": room.name,
+            "exp": int(time.time() + MAX_SESSION_TIME)
+        }
+        
+        logger.info("Creating owner token with dial-out permissions...")
+        token = await daily_helpers["rest"].create_meeting_token(properties=owner_token_properties)
         
         if not token:
-            logger.error("Failed to get token for room")
+            logger.error("Failed to get owner token for room")
             raise HTTPException(
                 status_code=500, 
-                detail="Failed to get token for room"
+                detail="Failed to get owner token for room"
             )
             
         # Start the dial-out bot
@@ -697,9 +746,18 @@ async def handle_dial_out(request: Request) -> JSONResponse:
         logger.info(f"Executing command: {bot_cmd}")
         
         try:
+            # Set up environment with Twilio SIP domain
+            env = os.environ.copy()
+            twilio_sip_domain = os.getenv("TWILIO_SIP_DOMAIN", "voxximai-twilio-integrationom")
+            env["TWILIO_SIP_DOMAIN"] = twilio_sip_domain
+            
+            # Ensure Daily API key is available to the dial-out process
+            env["DAILY_API_KEY"] = os.getenv("DAILY_API_KEY")
+            
             proc = subprocess.Popen(
                 bot_cmd,
                 shell=True,
+                env=env,
                 cwd=os.path.dirname(os.path.abspath(__file__))
             )
             logger.info(f"Dial-out bot process started with PID: {proc.pid}")
